@@ -1,0 +1,4 @@
+/target
+*.enc
+*.enc.bak
+*.sync-state
