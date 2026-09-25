@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use vault_core::{self as vault, Vault};
 
 // ---------- CLI ----------
 
@@ -100,7 +101,8 @@ impl ServerState {
         let dir = self.vault_dir(name);
         fs::create_dir_all(&dir)?;
 
-        // Write blob atomically via a temp file, then bump version.
+        // Blob goes down atomically via temp + rename; version is bumped last
+        // so a crash mid-write leaves the old version in place.
         let tmp = dir.join("blob.tmp");
         fs::write(&tmp, blob)?;
         fs::rename(&tmp, dir.join("blob"))?;
@@ -198,15 +200,35 @@ fn state_path(file: &Path) -> PathBuf {
     p
 }
 
-fn read_version(file: &Path) -> u64 {
-    fs::read_to_string(state_path(file))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0)
+/// Read the sidecar file. Returns (name, version).
+/// The name is what the server calls this vault; it persists across file
+/// renames and is inherited when you copy the sidecar (so two files with the
+/// same sidecar sync to the same server vault).
+fn read_state(file: &Path) -> (Option<String>, u64) {
+    let content = match fs::read_to_string(state_path(file)) {
+        Ok(c) => c,
+        Err(_) => return (None, 0),
+    };
+    let mut name = None;
+    let mut version = 0;
+    for line in content.lines() {
+        if let Some(n) = line.strip_prefix("name: ") {
+            name = Some(n.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("version: ") {
+            version = v.trim().parse().unwrap_or(0);
+        } else if let Ok(v) = line.trim().parse::<u64>() {
+            // legacy sidecar format: bare version number
+            version = v;
+        }
+    }
+    (name, version)
 }
 
-fn write_version(file: &Path, version: u64) -> Result<()> {
-    fs::write(state_path(file), format!("{}\n", version))?;
+fn write_state(file: &Path, name: &str, version: u64) -> Result<()> {
+    fs::write(
+        state_path(file),
+        format!("name: {}\nversion: {}\n", name, version),
+    )?;
     Ok(())
 }
 
@@ -214,6 +236,12 @@ fn vault_name_for(file: &Path, explicit: Option<&str>) -> String {
     if let Some(n) = explicit {
         return n.to_string();
     }
+    // Prefer the name recorded in the sidecar — this is what makes a copy of
+    // the file (and its sidecar) target the same server vault.
+    if let (Some(n), _) = read_state(file) {
+        return n;
+    }
+    // Otherwise fall back to the filename stem.
     file.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "vault".into())
@@ -227,8 +255,8 @@ fn vault_url(server: &str, name: &str) -> String {
 
 async fn cmd_push(file: &Path, server: &str, vault_name: Option<&str>) -> Result<()> {
     let blob = fs::read(file).with_context(|| format!("reading {}", file.display()))?;
-    let local_version = read_version(file);
     let name = vault_name_for(file, vault_name);
+    let (_, local_version) = read_state(file);
 
     let client = reqwest::Client::new();
     let resp = client
@@ -248,7 +276,7 @@ async fn cmd_push(file: &Path, server: &str, vault_name: Option<&str>) -> Result
 
     match status {
         reqwest::StatusCode::OK => {
-            write_version(file, server_version)?;
+            write_state(file, &name, server_version)?;
             println!(
                 "Pushed '{}'. Server is now at version {}.",
                 name, server_version
@@ -285,7 +313,7 @@ async fn cmd_pull(file: &Path, server: &str, vault_name: Option<&str>) -> Result
         reqwest::StatusCode::OK => {
             let bytes = resp.bytes().await?;
             fs::write(file, &bytes).with_context(|| format!("writing {}", file.display()))?;
-            write_version(file, server_version)?;
+            write_state(file, &name, server_version)?;
             println!(
                 "Pulled '{}' version {} into {}",
                 name,
@@ -295,13 +323,14 @@ async fn cmd_pull(file: &Path, server: &str, vault_name: Option<&str>) -> Result
             Ok(())
         }
         reqwest::StatusCode::NOT_FOUND => {
-            bail!("server has no vault named '{}' yet — push from another device first", name);
+            bail!(
+                "server has no vault named '{}' yet — push from another device first",
+                name
+            );
         }
         s => bail!("unexpected status {} (server version {})", s, server_version),
     }
 }
-
-use vault_core::{self as vault, Vault};
 
 async fn cmd_merge(file: &Path, server: &str, vault_name: Option<&str>) -> Result<()> {
     let password = rpassword::prompt_password("Master password: ")?;
@@ -311,7 +340,7 @@ async fn cmd_merge(file: &Path, server: &str, vault_name: Option<&str>) -> Resul
     let local = vault::load_vault(&file.to_string_lossy(), &password)
         .with_context(|| format!("loading local vault {}", file.display()))?;
 
-    let local_version = read_version(file);
+    let (_, local_version) = read_state(file);
 
     // Fetch remote blob
     let client = reqwest::Client::new();
@@ -342,7 +371,7 @@ async fn cmd_merge(file: &Path, server: &str, vault_name: Option<&str>) -> Resul
 
     // --- THE MERGE ---
     // Start from local, then walk remote and add anything we don't have.
-    // For entries present in both but different, keep local and warn.
+    // On conflicting entries, keep local and warn.
     let mut merged = Vault {
         entries: local.entries.clone(),
     };
@@ -354,7 +383,6 @@ async fn cmd_merge(file: &Path, server: &str, vault_name: Option<&str>) -> Resul
             Some(l) => {
                 if l != r {
                     conflicts.push(r.site.clone());
-                    // local wins
                 }
             }
         }
@@ -364,10 +392,10 @@ async fn cmd_merge(file: &Path, server: &str, vault_name: Option<&str>) -> Resul
         eprintln!("Conflicts on (local wins): {}", conflicts.join(", "));
     }
 
-    // Write the merged vault locally with a fresh save (new salt, new nonce)
+    // Write merged vault locally with a fresh salt and nonce.
     vault::save_vault(&file.to_string_lossy(), &merged, &password)?;
 
-    // Push merged to server, with the current server version
+    // Push merged blob to the server.
     let blob = fs::read(file)?;
     let push_resp = client
         .put(vault_url(server, &name))
@@ -385,7 +413,7 @@ async fn cmd_merge(file: &Path, server: &str, vault_name: Option<&str>) -> Resul
 
     match push_resp.status() {
         reqwest::StatusCode::OK => {
-            write_version(file, new_server_version)?;
+            write_state(file, &name, new_server_version)?;
             println!(
                 "Merged '{}' (local v{} + remote v{}), pushed. Server now at version {}.",
                 name, local_version, server_version, new_server_version
