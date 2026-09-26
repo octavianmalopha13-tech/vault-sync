@@ -1946,6 +1946,8 @@ dependencies = [
  "clap",
  "reqwest",
  "rpassword",
+ "serde_json",
+ "subtle",
  "tokio",
  "vault-core",
  "zeroize",

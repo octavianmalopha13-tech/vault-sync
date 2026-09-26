@@ -1,12 +1,15 @@
 use anyhow::{bail, Context, Result};
 use axum::{
     body::Bytes,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode},
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse,Response},
     routing::get,
-    Router,
+    Json,Router,
 };
+use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,6 +34,8 @@ enum Commands {
         bind: String,
         #[arg(long, default_value = "sync-server")]
         data_dir: PathBuf,
+        #[arg(long)]
+        secret: Option<String>,
     },
     /// Push a local file to the server
     Push {
@@ -39,6 +44,8 @@ enum Commands {
         server: String,
         #[arg(long)]
         vault_name: Option<String>,
+        #[arg(long)]
+        secret: Option<String>,
     },
     /// Pull the server's blob into a local file
     Pull {
@@ -47,6 +54,8 @@ enum Commands {
         server: String,
         #[arg(long)]
         vault_name: Option<String>,
+        #[arg(long)]
+        secret: Option<String>,
     },
     /// Merge a remote vault into a local one (client-side merge)
     Merge {
@@ -55,22 +64,59 @@ enum Commands {
         server: String,
         #[arg(long)]
         vault_name: Option<String>,
+        #[arg(long)]
+        secret: Option<String>,
     },
+   
+   /* Push {
+    file: PathBuf,
+    #[arg(long)] server: String,
+    #[arg(long)] vault_name: Option<String>,
+    #[arg(long)] secret: Option<String>,
+    },
+    Pull {
+    file: PathBuf,
+    #[arg(long)] server: String,
+    #[arg(long)] vault_name: Option<String>,
+    #[arg(long)] secret: Option<String>,
+    },
+    Merge {
+    file: PathBuf,
+    #[arg(long)] server: String,
+    #[arg(long)] vault_name: Option<String>,
+    #[arg(long)] secret: Option<String>,
+    },*/
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Serve { bind, data_dir } => cmd_serve(&bind, &data_dir).await,
-        Commands::Push { file, server, vault_name } => {
+        //Commands::Serve { bind, data_dir, secret } => {
+          //  cmd_serve(&bind, &data_dir, secret.as_deref()).await
+        //}
+       
+        //Commands::Serve { bind, data_dir } => cmd_serve(&bind, &data_dir).await,
+        /*Commands::Push { file, server, vault_name, secret } => {
             cmd_push(&file, &server, vault_name.as_deref()).await
         }
-        Commands::Pull { file, server, vault_name } => {
+        Commands::Pull { file, server, vault_name, secret } => {
             cmd_pull(&file, &server, vault_name.as_deref()).await
         }
-        Commands::Merge { file, server, vault_name } => {
+        Commands::Merge { file, server, vault_name, secret } => {
             cmd_merge(&file, &server, vault_name.as_deref()).await
+        }*/
+        Commands::Serve { bind, data_dir, secret } => {
+            cmd_serve(&bind, &data_dir, secret.as_deref()).await
+        }
+        Commands::Push { file, server, vault_name, secret } => {
+            cmd_push(&file, &server, vault_name.as_deref(), secret.as_deref()).await
+        }
+        Commands::Pull { file, server, vault_name, secret } => {
+            cmd_pull(&file, &server, vault_name.as_deref(), secret.as_deref()).await
+        }
+        Commands::Merge { file, server, vault_name, secret } => {
+            cmd_merge(&file, &server, vault_name.as_deref(), secret.as_deref()).await
         }
     }
 }
@@ -79,6 +125,7 @@ async fn main() -> Result<()> {
 
 struct ServerState {
     data_dir: PathBuf,
+    secret:Zeroizing<String>,
 }
 
 impl ServerState {
@@ -112,16 +159,59 @@ impl ServerState {
     }
 }
 
-async fn cmd_serve(bind: &str, data_dir: &Path) -> Result<()> {
+fn constant_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
+}
+
+async fn auth_middleware(
+    State(state): State<Arc<ServerState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let provided = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+
+    if !constant_eq(provided.as_bytes(), state.secret.as_bytes()) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
+
+    next.run(req).await
+}
+
+async fn cmd_serve(bind: &str, data_dir: &Path, secret: Option<&str>) -> Result<()> {
+    let secret = match secret{
+       Some(s) if !s.is_empty()=>Zeroizing::new(s.to_string()),
+       _=>match std::env::var("VAULT_SYNC_TOKEN"){
+         Ok(s) if !s.is_empty()=>Zeroizing::new(s),
+         _=>bail!(
+           "no secret configured.\n\
+            Pass --secret <token>, or set VAULT_SYNC_TOKEN in the environment"
+       ),
+      },
+    };   
+
     fs::create_dir_all(data_dir.join("vaults"))
         .with_context(|| format!("creating data dir {}", data_dir.display()))?;
 
     let state = Arc::new(ServerState {
         data_dir: data_dir.to_path_buf(),
+        secret,
     });
 
     let app = Router::new()
         .route("/vaults/{name}", get(get_vault).put(put_vault))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind)
@@ -236,7 +326,7 @@ fn vault_name_for(file: &Path, explicit: Option<&str>) -> String {
     if let Some(n) = explicit {
         return n.to_string();
     }
-    // Prefer the name recorded in the sidecar — this is what makes a copy of
+    // Prefer the name recorded in the sidecar - this is what makes a copy of
     // the file (and its sidecar) target the same server vault.
     if let (Some(n), _) = read_state(file) {
         return n;
@@ -247,21 +337,38 @@ fn vault_name_for(file: &Path, explicit: Option<&str>) -> String {
         .unwrap_or_else(|| "vault".into())
 }
 
+fn resolve_secret(cli_secret: Option<&str>) -> Result<Zeroizing<String>> {
+    if let Some(s) = cli_secret {
+        if s.is_empty() {
+            bail!("--secret cannot be empty");
+        }
+        return Ok(Zeroizing::new(s.to_string()));
+    }
+    match std::env::var("VAULT_SYNC_TOKEN") {
+        Ok(s) if !s.is_empty() => Ok(Zeroizing::new(s)),
+        _ => bail!(
+            "no secret: pass --secret <token> or set VAULT_SYNC_TOKEN in the environment"
+        ),
+    }
+}
+
 fn vault_url(server: &str, name: &str) -> String {
     format!("{}/vaults/{}", server.trim_end_matches('/'), name)
 }
 
 // ---------- client commands ----------
 
-async fn cmd_push(file: &Path, server: &str, vault_name: Option<&str>) -> Result<()> {
+async fn cmd_push(file: &Path, server: &str, vault_name: Option<&str>, cli_secret: Option<&str>) -> Result<()> {
     let blob = fs::read(file).with_context(|| format!("reading {}", file.display()))?;
     let name = vault_name_for(file, vault_name);
     let (_, local_version) = read_state(file);
+    let secret = resolve_secret(cli_secret)?;
 
     let client = reqwest::Client::new();
     let resp = client
         .put(vault_url(server, &name))
         .header("x-vault-version", local_version.to_string())
+        .header("authorization", format!("Bearer {}", secret.as_str()))
         .body(blob)
         .send()
         .await?;
@@ -283,6 +390,7 @@ async fn cmd_push(file: &Path, server: &str, vault_name: Option<&str>) -> Result
             );
             Ok(())
         }
+        reqwest::StatusCode::UNAUTHORIZED =>bail!("unauthorized ¬¬check your secret"),
         reqwest::StatusCode::CONFLICT => {
             bail!(
                 "Conflict on '{}': server is at version {}; your local state is {}.\n\
@@ -296,10 +404,14 @@ async fn cmd_push(file: &Path, server: &str, vault_name: Option<&str>) -> Result
     }
 }
 
-async fn cmd_pull(file: &Path, server: &str, vault_name: Option<&str>) -> Result<()> {
+async fn cmd_pull(file: &Path, server: &str, vault_name: Option<&str>, cli_secret: Option<&str>) -> Result<()> {
     let name = vault_name_for(file, vault_name);
     let client = reqwest::Client::new();
-    let resp = client.get(vault_url(server, &name)).send().await?;
+    let secret = resolve_secret(cli_secret)?;
+    let resp = client.get(vault_url(server, &name))
+    .header("authorization",format!("Bearer {}", secret.as_str()))
+    .send()
+    .await?;
 
     let status = resp.status();
     let server_version: u64 = resp
@@ -324,7 +436,7 @@ async fn cmd_pull(file: &Path, server: &str, vault_name: Option<&str>) -> Result
         }
         reqwest::StatusCode::NOT_FOUND => {
             bail!(
-                "server has no vault named '{}' yet — push from another device first",
+                "server has no vault named '{}' yet - push from another device first",
                 name
             );
         }
@@ -332,7 +444,7 @@ async fn cmd_pull(file: &Path, server: &str, vault_name: Option<&str>) -> Result
     }
 }
 
-async fn cmd_merge(file: &Path, server: &str, vault_name: Option<&str>) -> Result<()> {
+async fn cmd_merge(file: &Path, server: &str, vault_name: Option<&str>, cli_secret: Option<&str>) -> Result<()> {
     let password = rpassword::prompt_password("Master password: ")?;
     let name = vault_name_for(file, vault_name);
 
@@ -344,7 +456,11 @@ async fn cmd_merge(file: &Path, server: &str, vault_name: Option<&str>) -> Resul
 
     // Fetch remote blob
     let client = reqwest::Client::new();
-    let resp = client.get(vault_url(server, &name)).send().await?;
+
+    let secret = resolve_secret(cli_secret)?;
+    let resp = client.get(vault_url(server, &name))
+        .header("authorization", format!("Bearer {}", secret.as_str()))
+        .send().await?;
 
     let server_version: u64 = resp
         .headers()
@@ -354,7 +470,7 @@ async fn cmd_merge(file: &Path, server: &str, vault_name: Option<&str>) -> Resul
         .unwrap_or(0);
 
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        println!("Server has no vault '{}' — pushing local.", name);
+        println!("Server has no vault '{}' - pushing local.", name);
     }
 
     let remote: Vault = if resp.status() == reqwest::StatusCode::OK {
@@ -400,6 +516,7 @@ async fn cmd_merge(file: &Path, server: &str, vault_name: Option<&str>) -> Resul
     let push_resp = client
         .put(vault_url(server, &name))
         .header("x-vault-version", server_version.to_string())
+        .header("authorization", format!("Bearer {}", secret.as_str()))
         .body(blob)
         .send()
         .await?;
